@@ -1,10 +1,58 @@
-import { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, ReactNode } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Search, Gamepad2, CreditCard, History, ShieldCheck, ChevronRight, Menu, X, Rocket, Sparkles, Trophy, MessageSquare, Send, Bot } from 'lucide-react';
+import { Search, Gamepad2, CreditCard, History, ShieldCheck, ChevronRight, Menu, X, Rocket, Sparkles, Trophy, MessageSquare, Send, Bot, LogIn, LogOut, User as UserIcon } from 'lucide-react';
 import { Game } from './types.ts';
 import { GoogleGenAI } from "@google/genai";
+import { auth, db, googleProvider, handleFirestoreError, OperationType, FirebaseUser } from './firebase';
+import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { collection, addDoc, onSnapshot, query, where, orderBy, setDoc, doc } from 'firebase/firestore';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// Error Boundary for Firestore Error Handling
+class ErrorBoundary extends React.Component<{ children: ReactNode }, { hasError: boolean, errorInfo: any }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, errorInfo: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    try {
+      const parsed = JSON.parse(error.message);
+      return { hasError: true, errorInfo: parsed };
+    } catch (e) {
+      return { hasError: true, errorInfo: { error: error.message } };
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center p-6 text-center">
+          <div className="bg-slate-900 border border-white/10 p-10 rounded-[40px] max-w-lg shadow-2xl">
+            <div className="w-16 h-16 bg-red-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+              <X className="text-red-400 w-8 h-8" />
+            </div>
+            <h2 className="text-2xl font-bold mb-4">Waduh, Ada Masalah!</h2>
+            <p className="text-slate-400 mb-6 font-medium">
+              Sepertinya ada gangguan saat mengakses data. Mohon maaf atas ketidaknyamanannya.
+            </p>
+            <pre className="bg-slate-950 p-4 rounded-xl text-xs text-left text-red-400 overflow-x-auto mb-8 font-mono">
+              {JSON.stringify(this.state.errorInfo, null, 2)}
+            </pre>
+            <button 
+              onClick={() => window.location.reload()}
+              className="bg-indigo-600 hover:bg-indigo-500 px-8 py-3 rounded-2xl font-bold transition-all"
+            >
+              Segarkan Halaman
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Mock Data
 const POPULAR_GAMES: Game[] = [
@@ -17,6 +65,8 @@ const POPULAR_GAMES: Game[] = [
 ];
 
 export default function App() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [selectedGame, setSelectedGame] = useState<Game | null>(null);
@@ -24,6 +74,7 @@ export default function App() {
   const [selectedPayment, setSelectedPayment] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [orderComplete, setOrderComplete] = useState(false);
+  const [lastOrderId, setLastOrderId] = useState('');
 
   // AI Chat State
   const [isChatOpen, setIsChatOpen] = useState(false);
@@ -33,8 +84,49 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      setIsAuthReady(true);
+      if (u) {
+        // Update user profile in Firestore
+        const userRef = doc(db, 'users', u.uid);
+        try {
+          await setDoc(userRef, {
+            uid: u.uid,
+            email: u.email,
+            displayName: u.displayName,
+            photoURL: u.photoURL,
+            role: 'user', // Default role
+            updatedAt: Date.now()
+          }, { merge: true });
+        } catch (error) {
+          console.error("Error updating user profile:", error);
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory]);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login failed:", error);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setSelectedGame(null);
+    } catch (error) {
+      console.error("Logout failed:", error);
+    }
+  };
 
   const handleSendMessage = async () => {
     if (!chatMessage.trim()) return;
@@ -62,58 +154,109 @@ export default function App() {
     }
   };
 
+  const handleOrder = async () => {
+    if (!selectedDenom || !selectedPayment || !selectedGame) return;
+    if (!user) {
+      handleLogin();
+      return;
+    }
+
+    setIsProcessing(true);
+    const path = 'transactions';
+    try {
+      const orderData = {
+        userId: user.uid,
+        gameId: selectedGame.id,
+        gameName: selectedGame.name,
+        denomination: `${selectedDenom * 10} Diamonds`,
+        price: selectedDenom * 1000,
+        status: 'pending',
+        gameUserId: 'Player_ID_123', // Demo placeholder
+        paymentMethod: selectedPayment,
+        createdAt: Date.now()
+      };
+      
+      const docRef = await addDoc(collection(db, path), orderData);
+      setLastOrderId(`TV-${docRef.id.slice(0, 6).toUpperCase()}`);
+      
+      setTimeout(() => {
+        setIsProcessing(false);
+        setOrderComplete(true);
+      }, 1500);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, path);
+    }
+  };
+
   const PAYMENT_METHODS = [
     { id: 'qris', name: 'QRIS', icon: 'https://seeklogo.com/images/Q/qris-logo-3820047E2A-seeklogo.com.png' },
     { id: 'gopay', name: 'GoPay', icon: 'https://upload.wikimedia.org/wikipedia/commons/8/86/Gopay_logo.svg' },
     { id: 'ovo', name: 'OVO', icon: 'https://upload.wikimedia.org/wikipedia/commons/e/eb/Logo_ovo_purple.svg' },
-    { id: 'dana', name: 'DANA', icon: 'https://upload.wikimedia.org/wikipedia/commons/7/72/Logo_danamon_blue.svg' }, // Note: Using dana placeholder logic
+    { id: 'dana', name: 'DANA', icon: 'https://upload.wikimedia.org/wikipedia/commons/7/72/Logo_danamon_blue.svg' },
     { id: 'va', name: 'Virtual Account', icon: 'CreditCard' }
   ];
-
-  const handleOrder = () => {
-    if (!selectedDenom || !selectedPayment) return;
-    setIsProcessing(true);
-    setTimeout(() => {
-      setIsProcessing(false);
-      setOrderComplete(true);
-    }, 2000);
-  };
 
   const filteredGames = POPULAR_GAMES.filter(game => 
     game.name.toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500 selection:text-white">
-      {/* Navigation */}
-      <nav className="fixed top-0 w-full z-50 bg-slate-950/80 backdrop-blur-md border-b border-white/5">
-        <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2 group cursor-pointer" onClick={() => setSelectedGame(null)}>
-            <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/20 group-hover:scale-110 transition-transform">
-              <Gamepad2 className="text-white w-6 h-6" />
+    <ErrorBoundary>
+      <div className="min-h-screen bg-bg text-text-main font-sans selection:bg-accent selection:text-white">
+        {/* Navigation */}
+        <nav className="fixed top-0 w-full z-50 bg-bg/80 backdrop-blur-md border-b border-border">
+          <div className="max-w-7xl mx-auto px-10 h-[72px] flex items-center justify-between">
+            <div className="flex items-center gap-3 group cursor-pointer" onClick={() => setSelectedGame(null)}>
+              <div className="logo text-xl font-extrabold tracking-tighter flex items-center gap-2">
+                TOPUP<span className="text-accent">VERSE</span>
+              </div>
             </div>
-            <span className="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
-              TopUpVerse
-            </span>
-          </div>
 
-          <div className="hidden md:flex items-center gap-8 text-sm font-medium text-slate-400">
-            <a href="#" className="hover:text-white transition-colors" onClick={() => setSelectedGame(null)}>Beranda</a>
-            <a href="#" className="hover:text-white transition-colors">Daftar Harga</a>
-            <a href="#" className="hover:text-white transition-colors">Lacak Pesanan</a>
-            <button className="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-full transition-all shadow-lg shadow-indigo-500/10">
-              Masuk
+            <div className="flex-1 max-w-lg mx-12 hidden lg:block">
+              <div className="relative group">
+                <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-text-dim w-4 h-4 group-focus-within:text-accent transition-colors" />
+                <input 
+                  type="text" 
+                  placeholder="Search your favorite game..."
+                  className="w-full bg-surface border border-border rounded-lg py-2.5 pl-12 pr-4 text-sm outline-none focus:border-accent transition-all text-text-main placeholder:text-text-dim"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="hidden md:flex items-center gap-8 text-sm font-semibold text-text-dim">
+              <a href="#" className="hover:text-white transition-colors" onClick={() => setSelectedGame(null)}>Main Menu</a>
+              <a href="#" className="hover:text-white transition-colors">Support</a>
+              
+              {isAuthReady && (
+                user ? (
+                  <div className="flex items-center gap-3">
+                    <div className="flex flex-col items-end">
+                      <span className="text-white text-xs font-bold leading-none">{user.displayName?.split(' ')[0]}</span>
+                      <button onClick={handleLogout} className="text-[10px] text-text-dim hover:text-red-400 transition-colors uppercase tracking-widest">Logout</button>
+                    </div>
+                    <img src={user.photoURL || ''} alt="User" className="w-9 h-9 rounded-full border border-border" />
+                  </div>
+                ) : (
+                  <button 
+                    onClick={handleLogin}
+                    className="bg-accent hover:opacity-90 text-white px-6 py-2.5 rounded-lg font-bold transition-all shadow-lg shadow-accent/20 flex items-center gap-2"
+                  >
+                    Login
+                  </button>
+                )
+              )}
+            </div>
+
+            <button 
+              className="md:hidden p-2 text-slate-400"
+              onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            >
+              {isMobileMenuOpen ? <X /> : <Menu />}
             </button>
           </div>
-
-          <button 
-            className="md:hidden p-2 text-slate-400"
-            onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-          >
-            {isMobileMenuOpen ? <X /> : <Menu />}
-          </button>
-        </div>
-      </nav>
+        </nav>
 
       <main className="pt-24 pb-20">
         <AnimatePresence mode="wait">
@@ -125,77 +268,101 @@ export default function App() {
               exit={{ opacity: 0 }}
             >
               {/* Hero Section */}
-              <section className="max-w-7xl mx-auto px-4 mb-20 relative">
-                <div className="absolute top-0 right-0 -z-10 w-96 h-96 bg-indigo-600/20 blur-[120px] rounded-full" />
-                <div className="absolute bottom-0 left-0 -z-10 w-64 h-64 bg-fuchsia-600/20 blur-[100px] rounded-full" />
+              <section className="max-w-7xl mx-auto px-10 mb-20 relative">
+                <div className="absolute top-0 right-0 -z-10 w-96 h-96 bg-accent/10 blur-[120px] rounded-full" />
                 
-                <motion.div 
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.6 }}
-                  className="text-center max-w-3xl mx-auto"
-                >
-                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-xs font-semibold uppercase tracking-wider mb-6">
-                    <Sparkles className="w-3.5 h-3.5" />
-                    Promo Spesial Ramadhan
-                  </div>
-                  <h1 className="text-5xl md:text-7xl font-bold tracking-tight mb-6 leading-[1.1]">
-                    Top Up Game <br />
-                    <span className="bg-gradient-to-r from-indigo-400 to-fuchsia-400 bg-clip-text text-transparent">Kilat & Terpercaya</span>
-                  </h1>
-                  <p className="text-lg text-slate-400 mb-10 max-w-xl mx-auto leading-relaxed">
-                    Dapatkan diamond, credit, dan mata uang game favoritmu dengan harga termurah dan proses otomatis 24 jam.
-                  </p>
-                  
-                  <div className="relative max-w-xl mx-auto">
-                    <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 w-5 h-5" />
-                    <input 
-                      type="text" 
-                      placeholder="Cari game favoritmu..."
-                      className="w-full bg-slate-900 border border-white/5 rounded-2xl py-4 pl-12 pr-4 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50 transition-all text-slate-100 shadow-xl placeholder:text-slate-600"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                    />
-                  </div>
-                </motion.div>
+                <div className="flex flex-col lg:flex-row items-center gap-16 py-12">
+                  <motion.div 
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ duration: 0.6 }}
+                    className="flex-1 text-left"
+                  >
+                    <div className="inline-flex items-center gap-2 px-3 py-1 rounded-md bg-accent/10 border border-accent/20 text-accent text-[11px] font-bold uppercase tracking-widest mb-6">
+                      <span className="w-1.5 h-1.5 bg-accent rounded-full animate-pulse" />
+                      Official Authorized Partner
+                    </div>
+                    <h1 className="text-5xl lg:text-7xl font-black tracking-tighter mb-6 leading-none">
+                      LEVEL UP YOUR<br />
+                      <span className="text-accent underline decoration-accent/30 underline-offset-8">GAME EXPERIENCE</span>
+                    </h1>
+                    <p className="text-lg text-text-dim mb-10 max-w-lg leading-relaxed font-medium">
+                      Premium game top-up service. Fast, secure, and 100% legal. Join thousands of gamers who trust TopUpVerse.
+                    </p>
+                    
+                    <div className="flex gap-4">
+                      <button className="bg-accent hover:opacity-90 px-8 py-4 rounded-xl font-bold flex items-center gap-3 transition-all">
+                        Explore Games <ChevronRight className="w-4 h-4" />
+                      </button>
+                      <div className="flex items-center gap-4 px-6 border border-border rounded-xl text-sm font-bold text-text-dim">
+                        <ShieldCheck className="w-5 h-5 text-emerald-500" />
+                        Verified
+                      </div>
+                    </div>
+                  </motion.div>
+
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="hidden lg:block w-[400px] aspect-square bg-surface border border-border rounded-[40px] p-8 relative overflow-hidden"
+                  >
+                    <div className="absolute top-0 left-0 w-full h-full bg-gradient-to-br from-accent/5 to-transparent" />
+                    <div className="relative z-10 flex flex-col h-full">
+                      <div className="flex justify-between items-start mb-auto">
+                        <div className="w-16 h-16 bg-surface-light rounded-2xl flex items-center justify-center border border-border">
+                          <Trophy className="text-accent w-8 h-8" />
+                        </div>
+                        <div className="text-right">
+                          <p className="text-[10px] text-text-dim uppercase tracking-widest font-bold">Total Transactions</p>
+                          <p className="text-2xl font-black">100k+</p>
+                        </div>
+                      </div>
+                      <div className="space-y-4">
+                        {[1, 2].map(i => (
+                          <div key={i} className="flex gap-4 p-3 bg-bg border border-border rounded-xl">
+                            <div className="w-10 h-10 bg-accent/20 rounded-lg" />
+                            <div className="flex-1 flex flex-col justify-center">
+                              <div className="h-2 w-24 bg-surface-light rounded-full mb-2" />
+                              <div className="h-1.5 w-16 bg-surface-light/50 rounded-full" />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </motion.div>
+                </div>
               </section>
 
               {/* Categories / Grid */}
-              <section className="max-w-7xl mx-auto px-4">
-                <div className="flex items-center justify-between mb-8">
-                  <h2 className="text-2xl font-bold flex items-center gap-2">
-                    <Rocket className="text-indigo-500" />
-                    Game Populer
-                  </h2>
+              <section className="max-w-7xl mx-auto px-10">
+                <div className="flex items-center gap-4 mb-10">
+                  <div className="w-1 h-8 bg-accent rounded-full" />
+                  <h2 className="text-2xl font-bold tracking-tight">Popular Games</h2>
                 </div>
 
-                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-6">
+                <div className="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-6">
                   {filteredGames.map((game, idx) => (
                     <motion.div
                       key={game.id}
-                      initial={{ opacity: 0, scale: 0.9 }}
-                      animate={{ opacity: 1, scale: 1 }}
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
                       transition={{ delay: idx * 0.05 }}
-                      whileHover={{ y: -8 }}
-                      className="group relative cursor-pointer"
+                      whileHover={{ scale: 1.02 }}
+                      className="group bg-surface border border-border rounded-2xl p-4 cursor-pointer hover:border-accent transition-all hover:shadow-2xl hover:shadow-accent/5"
                       onClick={() => setSelectedGame(game)}
                     >
-                      <div className="aspect-[4/5] overflow-hidden rounded-2xl bg-slate-900 relative">
+                      <div className="aspect-video overflow-hidden rounded-xl bg-surface-light mb-4 relative">
                         <img 
                           src={game.image} 
                           alt={game.name}
                           referrerPolicy="no-referrer"
-                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-110 opacity-80 group-hover:opacity-100"
+                          className="w-full h-full object-cover grayscale-[0.2] group-hover:grayscale-0 transition-all duration-500"
                         />
-                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-950 via-slate-950/40 to-transparent p-4">
-                          <p className="text-xs font-semibold text-indigo-400 uppercase tracking-widest mb-1">{game.publisher}</p>
-                          <h3 className="font-bold text-lg leading-tight group-hover:text-indigo-400 transition-colors">{game.name}</h3>
-                        </div>
-                        <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg">
-                            <ChevronRight className="w-5 h-5" />
-                          </div>
-                        </div>
+                        <div className="absolute inset-0 bg-accent/10 opacity-0 group-hover:opacity-100 transition-opacity" />
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-lg leading-tight group-hover:text-accent transition-colors">{game.name}</h3>
+                        <p className="text-xs font-bold text-text-dim uppercase tracking-widest mt-1">{game.publisher}</p>
                       </div>
                     </motion.div>
                   ))}
@@ -203,18 +370,18 @@ export default function App() {
               </section>
 
               {/* Features Info */}
-              <section className="max-w-7xl mx-auto px-4 mt-32 grid md:grid-cols-3 gap-8">
+              <section className="max-w-7xl mx-auto px-10 mt-32 grid md:grid-cols-3 gap-8">
                 {[
                   { icon: ShieldCheck, title: "100% Aman & Legal", desc: "Transaksi terenkripsi dan sumber diamond resmi." },
                   { icon: CreditCard, title: "Metode Terlengkap", desc: "Support e-wallet, VA, gerai retail, hingga kartu kredit." },
                   { icon: History, title: "Layanan 24/7", desc: "Sistem otomatis yang bekerja setiap saat, bahkan di hari libur." }
                 ].map((feature, i) => (
-                  <div key={i} className="bg-white/5 border border-white/5 p-8 rounded-3xl hover:bg-white/10 transition-colors">
-                    <div className="w-12 h-12 bg-indigo-500/20 rounded-2xl flex items-center justify-center mb-6">
-                      <feature.icon className="text-indigo-400 w-6 h-6" />
+                  <div key={i} className="bg-surface border border-border p-8 rounded-3xl hover:bg-surface-light transition-colors group">
+                    <div className="w-12 h-12 bg-accent/10 rounded-2xl flex items-center justify-center mb-6 border border-accent/20 group-hover:bg-accent group-hover:border-accent transition-all">
+                      <feature.icon className="text-accent w-6 h-6 group-hover:text-white transition-colors" />
                     </div>
                     <h3 className="text-xl font-bold mb-3">{feature.title}</h3>
-                    <p className="text-slate-400 leading-relaxed text-sm">{feature.desc}</p>
+                    <p className="text-text-dim leading-relaxed text-sm">{feature.desc}</p>
                   </div>
                 ))}
               </section>
@@ -222,147 +389,152 @@ export default function App() {
           ) : (
             <motion.div
               key="game-detail"
-              initial={{ opacity: 0, x: 20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: -20 }}
-              className="max-w-4xl mx-auto px-4"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="max-w-7xl mx-auto px-10"
             >
               <button 
                 onClick={() => setSelectedGame(null)}
-                className="flex items-center gap-2 text-slate-400 hover:text-white mb-8 transition-colors group"
+                className="flex items-center gap-2 text-text-dim hover:text-white mb-8 transition-colors group text-sm font-bold uppercase tracking-widest"
               >
-                <ChevronRight className="rotate-180 w-5 h-5 group-hover:-translate-x-1 transition-transform" />
-                Kembali ke Beranda
+                <ChevronRight className="rotate-180 w-4 h-4 group-hover:-translate-x-1 transition-transform" />
+                Return to Dashboard
               </button>
 
-              <div className="grid md:grid-cols-3 gap-8">
-                {/* Game Info Card */}
-                <div className="md:col-span-1">
-                  <div className="sticky top-24 bg-slate-900 border border-white/5 rounded-3xl overflow-hidden p-6 text-center">
-                    <img 
-                      src={selectedGame.image} 
-                      alt={selectedGame.name}
-                      referrerPolicy="no-referrer"
-                      className="w-32 h-40 object-cover rounded-2xl mx-auto mb-6 shadow-2xl"
-                    />
-                    <h2 className="text-2xl font-bold mb-2">{selectedGame.name}</h2>
-                    <p className="text-indigo-400 text-sm font-medium mb-6">{selectedGame.publisher}</p>
-                    <div className="text-left text-xs text-slate-500 space-y-4">
-                      <p>Top Up {selectedGame.name} resmi dan aman 100%. Masukkan User ID Anda, pilih nominal, dan selesaikan pembayaran. Saldo akan otomatis masuk ke akun Anda.</p>
-                      <div className="pt-4 border-t border-white/5 flex items-center gap-2 text-emerald-400 font-semibold uppercase tracking-wider">
+              <div className="grid lg:grid-cols-12 gap-[1px] bg-border rounded-[32px] overflow-hidden border border-border">
+                {/* Game Info Panel */}
+                <div className="lg:col-span-3 bg-bg p-8">
+                  <div className="sticky top-28">
+                    <div className="aspect-[3/4] rounded-2xl overflow-hidden mb-6 border border-border shadow-2xl">
+                      <img 
+                        src={selectedGame.image} 
+                        alt={selectedGame.name}
+                        referrerPolicy="no-referrer"
+                        className="w-full h-full object-cover"
+                      />
+                    </div>
+                    <h2 className="text-2xl font-black mb-1">{selectedGame.name}</h2>
+                    <p className="text-accent text-sm font-bold uppercase tracking-widest mb-6">{selectedGame.publisher}</p>
+                    <div className="space-y-4 text-xs text-text-dim leading-relaxed font-medium">
+                      <p>Experience instant and secure top-ups for {selectedGame.name}. Use our official authorized channel for 100% legal delivery.</p>
+                      <div className="p-4 bg-surface border border-border rounded-xl flex items-center gap-3 text-emerald-500 font-bold uppercase tracking-tighter">
                         <ShieldCheck className="w-4 h-4" />
-                        Terverifikasi
+                        Official Partner
                       </div>
                     </div>
                   </div>
                 </div>
 
                 {/* Selection Forms */}
-                <div className="md:col-span-2 space-y-8">
-                  <div className="bg-slate-900 border border-white/5 rounded-3xl p-8">
-                    <div className="flex items-center gap-3 mb-6">
-                      <div className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center text-xs font-bold">1</div>
-                      <h3 className="text-lg font-bold">Lengkapi Data Akun</h3>
-                    </div>
-                    <div className="space-y-4">
-                      <div>
-                        <label className="block text-sm font-medium text-slate-400 mb-2">User ID</label>
+                <div className="lg:col-span-5 bg-bg p-8 border-x border-border">
+                  <h3 className="text-xl font-bold mb-8 flex items-center gap-3">
+                    <span className="w-1 h-6 bg-accent rounded-full" />
+                    Configure Order
+                  </h3>
+
+                  <div className="space-y-10">
+                    <div>
+                      <label className="block text-[11px] font-bold text-text-dim uppercase tracking-widest mb-4">Step 1: Account Information</label>
+                      <div className="space-y-4">
                         <input 
                           type="text" 
-                          placeholder="Masukkan User ID"
-                          className="w-full bg-slate-950 border border-white/10 rounded-xl py-3 px-4 focus:ring-2 focus:ring-indigo-500/50 outline-none transition-all"
+                          placeholder="Your User ID (e.g. 12345678)"
+                          className="w-full bg-surface border border-border rounded-xl py-4 px-6 focus:border-accent outline-none transition-all font-mono"
                         />
-                      </div>
-                      {selectedGame.slug === 'mobile-legends' && (
-                        <div>
-                          <label className="block text-sm font-medium text-slate-400 mb-2">Zone ID</label>
+                        {selectedGame.slug === 'mobile-legends' && (
                           <input 
                             type="text" 
-                            placeholder="Masukkan Zone ID"
-                            className="w-full bg-slate-950 border border-white/10 rounded-xl py-3 px-4 focus:ring-2 focus:ring-indigo-500/50 outline-none transition-all"
+                            placeholder="Zone ID (e.g. 1234)"
+                            className="w-full bg-surface border border-border rounded-xl py-4 px-6 focus:border-accent outline-none transition-all font-mono"
                           />
-                        </div>
-                      )}
+                        )}
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-bold text-text-dim uppercase tracking-widest mb-4">Step 2: Selection Nominal</label>
+                      <div className="grid grid-cols-2 gap-3">
+                        {[10, 50, 100, 250, 500, 1000].map((amount) => (
+                          <button 
+                            key={amount}
+                            onClick={() => setSelectedDenom(amount)}
+                            className={`text-left p-4 rounded-xl border transition-all ${
+                              selectedDenom === amount 
+                                ? 'border-accent bg-accent/5' 
+                                : 'border-border bg-surface hover:bg-surface-light'
+                            }`}
+                          >
+                            <span className="block text-[10px] text-text-dim font-bold uppercase mb-1">Game Item</span>
+                            <span className={`block font-bold ${selectedDenom === amount ? 'text-white' : 'text-text-main'}`}>
+                              {amount * 10} Diamonds
+                            </span>
+                            <span className="block text-xs font-bold text-accent mt-2">Rp {new Intl.NumberFormat('id-ID').format(amount * 1000)}</span>
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
+                </div>
 
-                  <div className="bg-slate-900 border border-white/5 rounded-3xl p-8">
-                    <div className="flex items-center gap-3 mb-6">
-                      <div className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center text-xs font-bold">2</div>
-                      <h3 className="text-lg font-bold">Pilih Nominal Top Up</h3>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4">
-                      {[10, 50, 100, 250, 500, 1000].map((amount) => (
-                        <button 
-                          key={amount}
-                          onClick={() => setSelectedDenom(amount)}
-                          className={`text-left p-4 rounded-2xl border transition-all group relative overflow-hidden ${
-                            selectedDenom === amount 
-                              ? 'border-indigo-500 bg-indigo-500/10' 
-                              : 'border-white/5 bg-slate-950 hover:border-indigo-500/50 hover:bg-slate-900'
-                          }`}
-                        >
-                          <p className="text-xs text-slate-500 mb-1 font-medium italic">💎 Diamonds</p>
-                          <p className={`text-lg font-bold transition-colors ${selectedDenom === amount ? 'text-indigo-400' : 'group-hover:text-indigo-400'}`}>
-                            {amount * 10} Diamonds
-                          </p>
-                          <p className="text-sm font-semibold text-slate-400">Rp {new Intl.NumberFormat('id-ID').format(amount * 1000)}</p>
-                          {selectedDenom === amount && (
-                            <div className="absolute top-2 right-2">
-                              <ShieldCheck className="w-4 h-4 text-indigo-400" />
+                {/* Checkout Panel */}
+                <div className="lg:col-span-4 bg-surface p-8">
+                  <h3 className="text-xl font-bold mb-8">Order Summary</h3>
+                  
+                  <div className="space-y-6">
+                    <div>
+                      <label className="block text-[11px] font-bold text-text-dim uppercase tracking-widest mb-4">Step 3: Payment Method</label>
+                      <div className="space-y-3">
+                        {PAYMENT_METHODS.map((method) => (
+                          <button 
+                            key={method.id}
+                            onClick={() => setSelectedPayment(method.id)}
+                            className={`w-full flex items-center justify-between p-4 rounded-xl border transition-all ${
+                              selectedPayment === method.id 
+                                ? 'border-accent bg-accent/10 shadow-lg shadow-accent/5' 
+                                : 'border-border bg-bg hover:bg-surface-light'
+                            }`}
+                          >
+                            <div className="flex items-center gap-4">
+                              <div className="w-10 h-7 bg-white rounded-md flex items-center justify-center p-1 overflow-hidden">
+                                {method.icon === 'CreditCard' ? (
+                                  <CreditCard className="text-bg w-4 h-4" />
+                                ) : (
+                                  <img src={method.icon} alt={method.name} className="w-full h-full object-contain" referrerPolicy="no-referrer" />
+                                )}
+                              </div>
+                              <span className="text-sm font-bold uppercase tracking-tight">{method.name}</span>
                             </div>
-                          )}
-                          <div className={`absolute -right-4 -bottom-4 w-12 h-12 bg-indigo-600/10 blur-xl rounded-full ${selectedDenom === amount ? 'scale-150 opacity-100' : 'opacity-0'}`} />
-                        </button>
-                      ))}
+                            {selectedDenom && (
+                              <span className="text-xs font-black text-accent">IDR {new Intl.NumberFormat('id-ID').format(selectedDenom * 1000 + (method.id === 'va' ? 2500 : 0))}</span>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="pt-6 border-t border-border mt-10">
+                      <div className="flex justify-between items-center mb-6">
+                        <span className="text-sm text-text-dim font-bold uppercase tracking-widest">Total Pay</span>
+                        <span className="text-2xl font-black text-white">
+                          {selectedDenom ? `Rp ${new Intl.NumberFormat('id-ID').format(selectedDenom * 1000)}` : 'Rp 0'}
+                        </span>
+                      </div>
+                      
+                      <button 
+                        disabled={!selectedDenom || !selectedPayment}
+                        onClick={handleOrder}
+                        className="w-full bg-accent hover:opacity-90 disabled:bg-surface-light disabled:text-text-dim disabled:cursor-not-allowed py-5 rounded-2xl font-black text-lg shadow-2xl shadow-accent/20 transition-all flex items-center justify-center gap-3 uppercase tracking-tighter"
+                      >
+                        {isProcessing ? (
+                          <div className="w-6 h-6 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+                        ) : (
+                          <>CONFIRM TOP UP <Rocket className="w-5 h-5" /></>
+                        )}
+                      </button>
+                      <p className="text-[10px] text-text-dim text-center mt-6 font-medium">Transaction protected by 256-bit SSL Encryption</p>
                     </div>
                   </div>
-
-                  <div className="bg-slate-900 border border-white/5 rounded-3xl p-8">
-                    <div className="flex items-center gap-3 mb-6">
-                      <div className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center text-xs font-bold">3</div>
-                      <h3 className="text-lg font-bold">Pilih Metode Pembayaran</h3>
-                    </div>
-                    <div className="space-y-3">
-                      {PAYMENT_METHODS.map((method) => (
-                        <button 
-                          key={method.id}
-                          onClick={() => setSelectedPayment(method.id)}
-                          className={`w-full flex items-center justify-between p-4 rounded-2xl border transition-all ${
-                            selectedPayment === method.id 
-                              ? 'border-indigo-500 bg-indigo-500/10' 
-                              : 'border-white/5 bg-slate-950 hover:bg-slate-900'
-                          }`}
-                        >
-                          <div className="flex items-center gap-4">
-                            <div className="w-12 h-8 bg-white rounded-lg flex items-center justify-center p-1 overflow-hidden">
-                              {method.icon === 'CreditCard' ? (
-                                <CreditCard className="text-slate-900 w-6 h-6" />
-                              ) : (
-                                <img src={method.icon} alt={method.name} className="w-full h-full object-contain" referrerPolicy="no-referrer" />
-                              )}
-                            </div>
-                            <span className="font-bold">{method.name}</span>
-                          </div>
-                          {selectedDenom && (
-                            <span className="text-sm font-semibold">Rp {new Intl.NumberFormat('id-ID').format(selectedDenom * 1000 + (method.id === 'va' ? 2500 : 0))}</span>
-                          )}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <button 
-                    disabled={!selectedDenom || !selectedPayment}
-                    onClick={handleOrder}
-                    className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:cursor-not-allowed py-4 rounded-2xl font-bold text-lg shadow-xl shadow-indigo-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
-                  >
-                    {isProcessing ? (
-                      <div className="w-6 h-6 border-4 border-white/20 border-t-white rounded-full animate-spin" />
-                    ) : (
-                      "Beli Sekarang"
-                    )}
-                  </button>
                 </div>
               </div>
 
@@ -372,31 +544,31 @@ export default function App() {
                   <motion.div 
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    className="fixed inset-0 z-[100] bg-slate-950/90 backdrop-blur-xl flex items-center justify-center p-4"
+                    className="fixed inset-0 z-[100] bg-bg/95 backdrop-blur-xl flex items-center justify-center p-4"
                   >
                     <motion.div 
                       initial={{ scale: 0.9, opacity: 0 }}
                       animate={{ scale: 1, opacity: 1 }}
-                      className="bg-slate-900 border border-white/10 p-8 rounded-[40px] max-w-sm w-full text-center shadow-2xl"
+                      className="bg-surface border border-border p-10 rounded-[40px] max-w-sm w-full text-center shadow-2xl"
                     >
-                      <div className="w-20 h-20 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+                      <div className="w-20 h-20 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-6 border border-emerald-500/30">
                         <ShieldCheck className="text-emerald-400 w-10 h-10" />
                       </div>
-                      <h3 className="text-2xl font-bold mb-2">Pesanan Diproses!</h3>
-                      <p className="text-slate-400 mb-8">Terima kasih telah melakukan top up di TopUpVerse. Diamonds akan masuk secara otomatis dalam beberapa menit.</p>
+                      <h3 className="text-2xl font-black mb-2 uppercase tracking-tight">Order Proceeding!</h3>
+                      <p className="text-text-dim text-sm mb-8 font-medium">Thank you for choosing TopUpVerse. Your diamonds are being delivered to your account instantly.</p>
                       
-                      <div className="bg-slate-950 rounded-2xl p-4 mb-8 text-left space-y-2 border border-white/5">
-                        <div className="flex justify-between text-xs">
-                          <span className="text-slate-500">No. Pesanan</span>
-                          <span className="font-mono text-indigo-400 uppercase">TV-{Math.random().toString(36).substr(2, 9)}</span>
+                      <div className="bg-bg rounded-2xl p-5 mb-8 text-left space-y-3 border border-border">
+                        <div className="flex justify-between text-[10px] font-bold uppercase tracking-widest">
+                          <span className="text-text-dim">Order ID</span>
+                          <span className="text-accent">{lastOrderId}</span>
                         </div>
-                        <div className="flex justify-between text-xs">
-                          <span className="text-slate-500">Username</span>
-                          <span className="font-bold">Player_One</span>
+                        <div className="flex justify-between text-[10px] font-bold uppercase tracking-widest">
+                          <span className="text-text-dim">Player ID</span>
+                          <span className="text-white">Player_One</span>
                         </div>
-                        <div className="flex justify-between text-xs pt-2 border-t border-white/5">
-                          <span className="text-slate-500 font-bold uppercase tracking-wider">Total</span>
-                          <span className="text-indigo-400 font-bold">Rp {new Intl.NumberFormat('id-ID').format(selectedDenom! * 1000)}</span>
+                        <div className="flex justify-between text-xs pt-3 border-t border-border">
+                          <span className="text-text-dim font-black uppercase">Total Paid</span>
+                          <span className="text-accent font-black">Rp {new Intl.NumberFormat('id-ID').format(selectedDenom! * 1000)}</span>
                         </div>
                       </div>
 
@@ -407,9 +579,9 @@ export default function App() {
                           setSelectedDenom(null);
                           setSelectedPayment(null);
                         }}
-                        className="w-full bg-slate-800 hover:bg-slate-700 py-4 rounded-2xl font-bold transition-all"
+                        className="w-full bg-surface-light hover:bg-border py-4 rounded-xl font-black uppercase tracking-widest text-xs transition-all border border-border"
                       >
-                        Selesai
+                        Close Portal
                       </button>
                     </motion.div>
                   </motion.div>
@@ -420,47 +592,15 @@ export default function App() {
         </AnimatePresence>
       </main>
 
-      <footer className="border-t border-white/5 bg-slate-950 py-16">
-        <div className="max-w-7xl mx-auto px-4">
-          <div className="grid md:grid-cols-4 gap-12">
-            <div className="col-span-2">
-              <div className="flex items-center gap-2 mb-6 cursor-pointer" onClick={() => setSelectedGame(null)}>
-                <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
-                  <Gamepad2 className="text-white w-5 h-5" />
-                </div>
-                <span className="text-xl font-bold uppercase tracking-tighter">TopUpVerse</span>
-              </div>
-              <p className="text-slate-500 max-w-sm leading-relaxed mb-8">
-                Penyedia layanan top up game favorit Anda yang telah melayani ribuan transaksi setiap harinya dengan tingkat kepuasan pelanggan yang tinggi.
-              </p>
-              <div className="flex gap-4">
-                {[1, 2, 3].map(i => (
-                  <div key={i} className="w-10 h-10 rounded-full border border-white/10 flex items-center justify-center hover:bg-indigo-600 hover:border-indigo-600 transition-all cursor-pointer group">
-                    <Trophy className="w-4 h-4 text-slate-400 group-hover:text-white" />
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div>
-              <h4 className="font-bold mb-6 uppercase tracking-widest text-xs text-slate-500">Bantuan</h4>
-              <ul className="space-y-4 text-sm text-slate-400 font-medium">
-                <li><a href="#" className="hover:text-indigo-400 transition-colors">Hubungi Kami</a></li>
-                <li><a href="#" className="hover:text-indigo-400 transition-colors">Syarat & Ketentuan</a></li>
-                <li><a href="#" className="hover:text-indigo-400 transition-colors">FAQ</a></li>
-              </ul>
-            </div>
-            <div>
-              <h4 className="font-bold mb-6 uppercase tracking-widest text-xs text-slate-500">Socials</h4>
-              <ul className="space-y-4 text-sm text-slate-400 font-medium">
-                <li><a href="#" className="hover:text-indigo-400 transition-colors">Instagram</a></li>
-                <li><a href="#" className="hover:text-indigo-400 transition-colors">TikTok</a></li>
-                <li><a href="#" className="hover:text-indigo-400 transition-colors">Twitter</a></li>
-              </ul>
-            </div>
-          </div>
-          <div className="mt-16 pt-8 border-t border-white/5 text-center text-slate-600 text-sm">
-            &copy; 2026 TopUpVerse. Seluruh hak cipta dilindungi.
-          </div>
+      <footer className="border-t border-border bg-surface-light/30 backdrop-blur-sm py-12">
+        <div className="max-w-7xl mx-auto px-10 text-xs text-text-dim flex flex-wrap justify-center gap-12 font-bold uppercase tracking-widest">
+          <div className="flex items-center gap-2"><span className="w-2 h-2 bg-emerald-500 rounded-full" /> Server Status: 100% Operational</div>
+          <div>Official Authorized Partner</div>
+          <div>24/7 Customer Support</div>
+          <div>Instant Delivery Guarantee</div>
+        </div>
+        <div className="mt-12 text-center text-[10px] text-text-dim/50 uppercase tracking-[0.2em]">
+          &copy; 2026 TopUpVerse. Premium Game Experience.
         </div>
       </footer>
 
@@ -472,12 +612,12 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="absolute bottom-20 right-0 w-80 h-[450px] bg-slate-900 border border-white/10 rounded-[32px] shadow-2xl flex flex-col overflow-hidden backdrop-blur-xl"
+              className="absolute bottom-20 right-0 w-80 h-[450px] bg-surface border border-border rounded-[32px] shadow-2xl flex flex-col overflow-hidden backdrop-blur-xl"
             >
-              <div className="p-5 bg-indigo-600 flex items-center justify-between">
+              <div className="p-5 bg-accent flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Bot className="w-5 h-5" />
-                  <span className="font-bold text-sm">Verse AI Assistant</span>
+                  <span className="font-black text-xs uppercase tracking-widest">Verse Assistant</span>
                 </div>
                 <button onClick={() => setIsChatOpen(false)}><X className="w-4 h-4" /></button>
               </div>
@@ -486,15 +626,15 @@ export default function App() {
                 {chatHistory.length === 0 && (
                   <div className="text-center py-10">
                     <div className="w-12 h-12 bg-white/5 rounded-full flex items-center justify-center mx-auto mb-4">
-                      <Bot className="text-indigo-400 w-6 h-6" />
+                      <Bot className="text-accent w-6 h-6" />
                     </div>
-                    <p className="text-slate-400 text-sm">Halo! Ada yang bisa saya bantu buat top up hari ini?</p>
+                    <p className="text-text-dim text-xs font-bold uppercase tracking-widest">Need help with top-up?</p>
                   </div>
                 )}
                 {chatHistory.map((chat, i) => (
                   <div key={i} className={`flex ${chat.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[80%] p-3 rounded-2xl text-sm ${
-                      chat.role === 'user' ? 'bg-indigo-600 text-white' : 'bg-white/5 border border-white/5 text-slate-200'
+                    <div className={`max-w-[80%] p-3 rounded-2xl text-xs font-medium ${
+                      chat.role === 'user' ? 'bg-accent text-white' : 'bg-surface-light border border-border text-text-main'
                     }`}>
                       {chat.text}
                     </div>
@@ -502,29 +642,29 @@ export default function App() {
                 ))}
                 {isTyping && (
                   <div className="flex justify-start">
-                    <div className="bg-white/5 p-3 rounded-2xl flex gap-1">
-                      <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce" />
-                      <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce delay-75" />
-                      <div className="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce delay-150" />
+                    <div className="bg-surface-light p-3 rounded-2xl flex gap-1 border border-border">
+                      <div className="w-1.5 h-1.5 bg-accent rounded-full animate-bounce" />
+                      <div className="w-1.5 h-1.5 bg-accent rounded-full animate-bounce delay-75" />
+                      <div className="w-1.5 h-1.5 bg-accent rounded-full animate-bounce delay-150" />
                     </div>
                   </div>
                 )}
                 <div ref={chatEndRef} />
               </div>
 
-              <div className="p-4 bg-slate-950 border-t border-white/5">
+              <div className="p-4 bg-bg border-t border-border">
                 <div className="relative">
                   <input 
                     type="text" 
-                    placeholder="Tanya sesuatu..."
-                    className="w-full bg-slate-900 border border-white/10 rounded-xl py-2 pl-4 pr-10 text-sm outline-none focus:border-indigo-500 transition-colors"
+                    placeholder="Type your message..."
+                    className="w-full bg-surface border border-border rounded-xl py-2 pl-4 pr-10 text-xs outline-none focus:border-accent transition-colors text-white"
                     value={chatMessage}
                     onChange={(e) => setChatMessage(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                   />
                   <button 
                     onClick={handleSendMessage}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-indigo-400 hover:text-white transition-colors"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-accent hover:text-white transition-colors"
                   >
                     <Send className="w-4 h-4" />
                   </button>
@@ -538,15 +678,16 @@ export default function App() {
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.95 }}
           onClick={() => setIsChatOpen(!isChatOpen)}
-          className="w-14 h-14 bg-indigo-600 rounded-full flex items-center justify-center shadow-lg shadow-indigo-600/30 text-white relative group"
+          className="w-14 h-14 bg-accent rounded-full flex items-center justify-center shadow-lg shadow-accent/30 text-white relative group border border-white/10"
         >
           <MessageSquare className="w-6 h-6 group-hover:rotate-12 transition-transform" />
           {!isChatOpen && (
-            <div className="absolute -top-1 -right-1 w-4 h-4 bg-fuchsia-500 border-2 border-slate-950 rounded-full" />
+            <div className="absolute -top-1 -right-1 w-4 h-4 bg-emerald-500 border-2 border-bg rounded-full" />
           )}
         </motion.button>
       </div>
     </div>
-  );
+  </ErrorBoundary>
+);
 }
 

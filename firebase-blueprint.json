@@ -1,0 +1,66 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "admin"] },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Game": {
+      "title": "Game",
+      "description": "Game available for top up",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "publisher": { "type": "string" },
+        "image": { "type": "string" },
+        "category": { "type": "string" },
+        "slug": { "type": "string" },
+        "isActive": { "type": "boolean" }
+      },
+      "required": ["name", "slug"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Transaction record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "gameId": { "type": "string" },
+        "gameName": { "type": "string" },
+        "denomination": { "type": "string" },
+        "price": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "success", "failed"] },
+        "gameUserId": { "type": "string" },
+        "gameServerId": { "type": "string" },
+        "paymentMethod": { "type": "string" },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["userId", "gameId", "price", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "User profile documents"
+    },
+    "/games/{gameId}": {
+      "schema": "Game",
+      "description": "Game catalog"
+    },
+    "/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "Transaction history"
+    }
+  }
+}
