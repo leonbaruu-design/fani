@@ -7,7 +7,7 @@ import { auth, db, googleProvider, handleFirestoreError, OperationType, Firebase
 import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
 import { collection, addDoc, onSnapshot, query, where, orderBy, setDoc, doc } from 'firebase/firestore';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
 
 // Error Boundary for Firestore Error Handling
 class ErrorBoundary extends React.Component<{ children: ReactNode }, { hasError: boolean, errorInfo: any }> {
@@ -135,6 +135,12 @@ export default function App() {
     setChatHistory(prev => [...prev, { role: 'user', text: userText }]);
     setChatMessage('');
     setIsTyping(true);
+    
+    if (!ai) {
+      setChatHistory(prev => [...prev, { role: 'bot', text: "Layanan asisten AI sedang tidak tersedia saat ini. Silakan coba lagi nanti." }]);
+      setIsTyping(false);
+      return;
+    }
 
     try {
       const response = await ai.models.generateContent({
